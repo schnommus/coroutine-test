@@ -10,9 +10,9 @@ data ThreadStatus =
     ThreadPreempted | ThreadSyscall
         deriving Show
 
-type ThreadState = Coroutine (Yield ThreadStatus) IO String
+type ThreadContext = Coroutine (Yield ThreadStatus) IO String
 
-loopyThread :: String -> ThreadState
+loopyThread :: String -> ThreadContext
 loopyThread id = do
     lift $ putStrLn ("Init thread: " ++ id)
     whileM (return True) (do
@@ -21,41 +21,41 @@ loopyThread id = do
     lift $ putStrLn ("End of thread: " ++ id)
     return ("Return: " ++ id)
 
--- Scheduler picks this to stop scheduling
-dieThread :: ThreadState
+-- Kernel picks this to stop running
+dieThread :: ThreadContext
 dieThread = do
     lift $ putStrLn ("Dying...")
     return ("Returning dead")
 
 startWith = [loopyThread "A", loopyThread "B"]
 
-data SchedulerState = SchedulerState { threadStates :: [ThreadState]
-                                     , lastPicked :: Int
-                                     , pickIndex :: Int
-                                     }
+data KernelState = KernelState { threadStates :: [ThreadContext]
+                               , lastPicked   :: Int
+                               , timeStamp    :: Int
+                               }
 
-schedulerDo :: Show a => SchedulerState -> Yield a ThreadState -> (SchedulerState, ThreadState)
-schedulerDo currentSchedulerState (Yield x newThreadState) =
-    ((newSchedulerState), lift (print x) >> pickThread)
-        where newSchedulerState :: SchedulerState
-              newSchedulerState =
-                (SchedulerState
-                    ((threadStates currentSchedulerState) & element (lastPicked currentSchedulerState) .~ newThreadState)
-                    (newPickIndex)
-                    (succ $ pickIndex currentSchedulerState))
+kernelDo :: Show a => KernelState -> Yield a ThreadContext -> (KernelState, ThreadContext)
+kernelDo ks (Yield x newThreadContext) =
+    (ks', lift (putStrLn (show x ++ " @T=" ++ show (timeStamp ks))) >> pickThread)
+        where ks' = KernelState
+                        ((threadStates ks) & element (lastPicked ks) .~ newThreadContext)
+                        (newPickIndex)
+                        (timeStamp ks + 1)
+
               newPickIndex :: Int
-              newPickIndex = (pickIndex currentSchedulerState) `mod` (length $ threadStates currentSchedulerState)
-              pickThread :: ThreadState
-              pickThread = if (pickIndex currentSchedulerState < 10)
-                            then (threadStates currentSchedulerState) !! newPickIndex
+              newPickIndex = (lastPicked ks + 1) `mod` (length $ threadStates ks)
+
+              pickThread :: ThreadContext
+              pickThread = if (timeStamp ks < 10)
+                            then (threadStates ks) !! newPickIndex
                             else dieThread
 
 
-runScheduler :: ThreadState -> IO (SchedulerState, String)
-runScheduler = foldRun schedulerDo (SchedulerState startWith 0 1)
+runKernel :: ThreadContext -> IO (KernelState, String)
+runKernel = foldRun kernelDo (KernelState startWith 0 0)
 
 main :: IO ()
 main = do
-    (resultState, resultString) <- runScheduler (startWith!!0)
-    putStrLn ("Scheduler returned: " ++ resultString)
-    putStrLn ("pickIndex: " ++ (show $ pickIndex resultState))
+    (resultState, resultString) <- runKernel (startWith!!0)
+    putStrLn ("Kernel returned: " ++ resultString)
+    putStrLn ("timeStamp: " ++ (show $ timeStamp resultState))
