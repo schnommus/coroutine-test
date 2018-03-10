@@ -22,3 +22,5 @@ executable coroutine-test
   build-depends:       mtl
   build-depends:       lens
   build-depends:       monad-loops
+  build-depends:       word8
+  build-depends:       array
