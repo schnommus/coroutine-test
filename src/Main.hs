@@ -21,12 +21,12 @@ data NTFN
         = IdleNtfn
         | ActiveNtfn { ntfnMsgIdentifier :: Word }
         | WaitingNtfn { ntfnQueue :: [TCB] }
-    deriving Show
+        deriving (Show, Eq)
 
 data Notification = Notification {
     ntfnObj :: NTFN,
     ntfnBoundTCB :: Maybe TCB }
-        deriving Show
+        deriving (Show, Eq)
 
 data Endpoint
         = RecvEP { epQueue :: [TCB] }
@@ -56,6 +56,7 @@ data Syscall
         | SysReply
         | SysYield
         | SysNBRecv
+        | SysSpawnThread Priority ThreadContext (Maybe Notification)
     deriving (Show, Eq)
 
 data ThreadStatus =
@@ -66,6 +67,9 @@ type ThreadContext = Coroutine (Yield ThreadStatus) IO String
 
 instance Show ThreadContext where
     show tc = "<ThreadContext>"
+
+instance Eq ThreadContext where
+    x == y = False
 
 data TCB = TCB { tcbState :: ThreadState
                , tcbPriority :: Priority
@@ -121,20 +125,40 @@ getSchedulerAction = gets ksSchedulerAction
 setSchedulerAction :: SchedulerAction -> Kernel ()
 setSchedulerAction a = modify (\ks -> ks { ksSchedulerAction = a })
 
+puts = lift . putStrLn
+atomic op = do
+    op
+    yield ThreadPreempted
+syscall x = yield $ ThreadSyscall x
+
 loopyThread :: String -> ThreadContext
 loopyThread id = do
-    lift $ putStrLn ("Init thread: " ++ id)
+    atomic $ puts ("Init thread: " ++ id)
     whileM (return True) (do
-        lift $ putStrLn ("In thread: " ++ id)
-        yield ThreadPreempted)
-    lift $ putStrLn ("End of thread: " ++ id)
+        atomic $ puts ("In thread: " ++ id)
+        )
+    atomic $ puts ("End of thread: " ++ id)
     return ("Return: " ++ id)
 
+rootThread :: String -> ThreadContext
+rootThread id = do
+    atomic $ puts ("Init thread: " ++ id)
+    syscall $ SysSpawnThread 255 (loopyThread "[child1]") Nothing
+    syscall $ SysSpawnThread 255 (loopyThread "[child2]") Nothing
+    whileM (return True) (do
+        atomic $ puts ("In thread: " ++ id)
+        )
+    atomic $ puts ("End of thread: " ++ id)
+    return ("Return: " ++ id)
+
+timeSlice :: Int
+timeSlice = 5
+
 idle_thread = TCB
-    IdleThreadState 0 False 5 Nothing (loopyThread "[idle]") 0
+    IdleThreadState 0 False timeSlice Nothing (loopyThread "[idle]") 0
 
 root_thread = TCB
-    Running 255 False 5 Nothing (loopyThread "[root]") 1
+    Running 255 False timeSlice Nothing (rootThread "[root]") 1
 
 init_kernel_state = KernelState
     (array (0,255) [(i, []) | i <- [0..255]])
@@ -210,6 +234,7 @@ schedule :: Kernel ()
 schedule = do
         curThread <- getCurThread
         action <- getSchedulerAction
+        traceShow action $ (do
         case action of
              ResumeCurrentThread -> return ()
              SwitchToThread candidate -> do
@@ -238,8 +263,8 @@ schedule = do
                                  setSchedulerAction ResumeCurrentThread
              ChooseNewThread -> do
                  curRunnable <- isRunnable curThread
-                 when curRunnable $ tcbSchedEnqueue curThread
                  scheduleChooseNewThread
+                           )
 
 
 chooseThread :: Kernel ()
@@ -250,9 +275,11 @@ chooseThread = do
             prio <- getHighestPrio
             queue <- getQueue prio
             let thread = head queue
+            traceShow queue (do
             runnable <- isRunnable thread
             assert runnable
                 switchToThread thread
+                            )
         else
             switchToIdleThread
 
@@ -272,9 +299,6 @@ switchToIdleThread = do
         setCurThread thread
 
 
-timeSlice :: Int
-timeSlice = 2
-
 rescheduleRequired :: Kernel ()
 rescheduleRequired = do
     action <- getSchedulerAction
@@ -286,6 +310,7 @@ rescheduleRequired = do
 
 timerTick :: Kernel ()
 timerTick = do
+  ks <- get
   thread <- getCurThread
   state <- getThreadState thread
   modify (\ks -> ks { ksTimeStamp = ksTimeStamp ks + 1 })
@@ -297,15 +322,29 @@ timerTick = do
         then setCurThread $ thread{ tcbTimeSlice = ts' }
         else do
            setCurThread $ thread{ tcbTimeSlice = timeSlice }
+           thread <- getCurThread
            tcbSchedAppend thread
            rescheduleRequired
     _ -> return ()
+
+activateThread :: Kernel ()
+activateThread = do
+        thread <- getCurThread
+        state <- getThreadState thread
+        case state of
+            Running -> return ()
+            Restart -> do
+                modify (\ks -> ks { ksCurThread = thread{tcbState=Running} })
+            IdleThreadState -> do
+                return ()
+            _ -> fail $ "Current thread is blocked, state: " ++ show state
 
 
 kernelTick :: Kernel()
 kernelTick = do
     timerTick
     schedule
+    activateThread
 
 -- Kernel picks this to stop running
 dieThread :: ThreadContext
@@ -313,10 +352,17 @@ dieThread = do
     lift $ putStrLn ("Dying...")
     return ("Returning dead")
 
-kernelDo :: Show a => KernelState -> Yield a ThreadContext -> (KernelState, ThreadContext)
+kernelDo :: KernelState -> Yield ThreadStatus ThreadContext -> (KernelState, ThreadContext)
 kernelDo ks (Yield x newThreadContext) =
     (ks', lift (putStrLn (show x ++ " @T=" ++ show (ksTimeStamp ks))) >> pickThread)
-        where ks' = snd $ runState kernelTick (ks_updated_context)
+        where ks' = snd $ runState (actOn x) (ks_updated_context)
+
+              actOn :: ThreadStatus -> Kernel ()
+              actOn ThreadPreempted = kernelTick
+              actOn (ThreadSyscall (SysSpawnThread prio ctxt ntfn)) = do
+                  tcbSchedEnqueue $ TCB Restart prio False timeSlice ntfn ctxt (ksTimeStamp ks)
+                  kernelTick
+              actOn _ = assert False $ return () --unknown thread status / syscall?
 
               ks_updated_context :: KernelState
               ks_updated_context =
@@ -327,7 +373,7 @@ kernelDo ks (Yield x newThreadContext) =
                   where theTCB = ksCurThread ks
 
               pickThread :: ThreadContext
-              pickThread = if (ksTimeStamp ks' < 10)
+              pickThread = if (ksTimeStamp ks' < 20)
                               then tcbContext $ ksCurThread ks'
                               else dieThread
 
